@@ -1,18 +1,15 @@
 """
 app.py — RNN Student Performance Predictor
-Streamlit UI | No TensorFlow | Works on any Python version
+Trains model fresh every time — no joblib version conflicts.
 Run: streamlit run app.py
 """
 
 import streamlit as st
 import numpy as np
 import pandas as pd
-import joblib
-import os
 import warnings
 warnings.filterwarnings('ignore')
 
-# ── Page Config ────────────────────────────────────────────────
 st.set_page_config(
     page_title="RNN Student Predictor",
     page_icon="🧠",
@@ -20,7 +17,7 @@ st.set_page_config(
 )
 
 # ══════════════════════════════════════════════════════════════
-# EMBEDDED DATASET for auto-training on Streamlit Cloud
+# FULL EMBEDDED DATASET
 # ══════════════════════════════════════════════════════════════
 DATASET_ROWS = [
     [1,1,59,53,65,4,0],[1,2,60,51,55,5,0],[1,3,56,50,60,3,0],[1,4,60,51,50,5,0],[1,5,65,62,67,4,0],
@@ -75,12 +72,13 @@ DATASET_ROWS = [
     [50,1,52,54,56,2,0],[50,2,54,53,55,3,0],[50,3,57,56,58,4,0],[50,4,53,54,56,3,0],[50,5,56,57,60,4,0],
 ]
 
-FEATURES = ['attendance','assignment','quiz','study_hours']
+FEATURES = ['attendance', 'assignment', 'quiz', 'study_hours']
 
 # ══════════════════════════════════════════════════════════════
-# AUTO-TRAIN if model files missing (safety net for cloud)
+# TRAIN MODEL — runs once per session, no joblib files needed
 # ══════════════════════════════════════════════════════════════
-def auto_train():
+@st.cache_resource
+def get_model():
     from sklearn.neural_network  import MLPClassifier
     from sklearn.model_selection import train_test_split
     from sklearn.preprocessing   import StandardScaler
@@ -94,68 +92,78 @@ def auto_train():
         rows.append(grp[FEATURES].values.flatten())
         labels.append(int(grp['result'].iloc[-1]))
 
-    X = np.array(rows); y = np.array(labels)
-    X_tr, _, y_tr, _ = train_test_split(X, y, test_size=0.2,
-                                         random_state=42, stratify=y)
+    X = np.array(rows, dtype=float)
+    y = np.array(labels)
+
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
     scaler = StandardScaler()
     X_tr_s = scaler.fit_transform(X_tr)
-    mdl = MLPClassifier(hidden_layer_sizes=(128,64,32), activation='relu',
-                        solver='adam', max_iter=500, random_state=42,
-                        early_stopping=True, validation_fraction=0.15,
-                        n_iter_no_change=20)
+
+    mdl = MLPClassifier(
+        hidden_layer_sizes=(128, 64, 32),
+        activation='relu',
+        solver='adam',
+        max_iter=500,
+        random_state=42,
+        early_stopping=True,
+        validation_fraction=0.15,
+        n_iter_no_change=20,
+    )
     mdl.fit(X_tr_s, y_tr)
-    joblib.dump(mdl,    'model.joblib')
-    joblib.dump(scaler, 'scaler.joblib')
-    return mdl, scaler
+
+    # Quick accuracy check
+    X_te_s = scaler.transform(X_te)
+    from sklearn.metrics import accuracy_score
+    acc = accuracy_score(y_te, mdl.predict(X_te_s))
+
+    return mdl, scaler, round(acc * 100, 1)
 
 
-@st.cache_resource
-def load_artifacts():
-    if not os.path.exists('model.joblib') or not os.path.exists('scaler.joblib'):
-        return auto_train()
-    return joblib.load('model.joblib'), joblib.load('scaler.joblib')
-
-
-if not os.path.exists('model.joblib') or not os.path.exists('scaler.joblib'):
-    with st.spinner("⏳ First launch: Training model... please wait ~15 seconds"):
-        model, scaler = load_artifacts()
-else:
-    model, scaler = load_artifacts()
+# Train silently on startup
+with st.spinner("⏳ Loading model... please wait a moment"):
+    model, scaler, accuracy = get_model()
 
 
 # ══════════════════════════════════════════════════════════════
 # PREDICTION FUNCTION
 # ══════════════════════════════════════════════════════════════
 def predict_student(weekly_data):
-    flat   = np.array(weekly_data, dtype=float).flatten().reshape(1, -1)
-    flat_s = scaler.transform(flat)
-    pred   = int(model.predict(flat_s)[0])
-    probs  = model.predict_proba(flat_s)[0]
-    pp     = round(float(probs[1]) * 100, 2)
-    fp     = round(float(probs[0]) * 100, 2)
+    try:
+        flat   = np.array(weekly_data, dtype=float).flatten().reshape(1, -1)
+        flat_s = scaler.transform(flat)
+        pred   = int(model.predict(flat_s)[0])
+        probs  = model.predict_proba(flat_s)[0]
+        pp     = round(float(probs[1]) * 100, 2)
+        fp     = round(float(probs[0]) * 100, 2)
 
-    if pred == 1:
-        interp = ("🌟 Excellent – very high chance of passing!" if pp >= 80 else
-                  "✅ Good – likely to pass, keep it up!"        if pp >= 65 else
-                  "⚠️ Borderline pass – consistent effort needed.")
-    else:
-        interp = ("❌ High risk – urgent improvement required."  if fp >= 80 else
-                  "⚠️ Likely to fail – focus on weak areas now." if fp >= 65 else
-                  "🔶 At risk – small improvements can help.")
+        if pred == 1:
+            interp = ("🌟 Excellent – very high chance of passing!" if pp >= 80 else
+                      "✅ Good – likely to pass, keep it up!"        if pp >= 65 else
+                      "⚠️ Borderline pass – consistent effort needed.")
+        else:
+            interp = ("❌ High risk – urgent improvement required."  if fp >= 80 else
+                      "⚠️ Likely to fail – focus on weak areas now." if fp >= 65 else
+                      "🔶 At risk – small improvements can help.")
 
-    return {"result": pred,
-            "label": "Pass" if pred == 1 else "Fail",
-            "pass_prob": pp, "fail_prob": fp,
-            "interpretation": interp}
+        return {"success": True, "result": pred,
+                "label": "Pass" if pred == 1 else "Fail",
+                "pass_prob": pp, "fail_prob": fp,
+                "interpretation": interp}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 # ══════════════════════════════════════════════════════════════
 # UI — HEADER
 # ══════════════════════════════════════════════════════════════
-st.markdown("""
+st.markdown(f"""
 <h1 style='text-align:center;color:#5B2C8D;'>🧠 RNN Student Performance Predictor</h1>
 <p style='text-align:center;color:gray;'>
-    Sequence Neural Network — predicts Pass/Fail from 5 weeks of academic data
+    Sequence Neural Network · predicts Pass/Fail from 5 weeks of data · Accuracy: {accuracy}%
 </p>
 <hr/>
 """, unsafe_allow_html=True)
@@ -163,18 +171,18 @@ st.markdown("""
 # ── Sidebar ────────────────────────────────────────────────────
 with st.sidebar:
     st.header("ℹ️ About")
-    st.markdown("""
-    Predicts **Pass / Fail** using a neural network
+    st.markdown(f"""
+    Predicts **Pass / Fail** using a Neural Network
     trained on **5 weeks** of student behaviour.
 
-    **Model Architecture**
-    - Input: 5 weeks × 4 features = 20 values
-    - Hidden Layer 1 : 128 neurons (ReLU)
-    - Hidden Layer 2 : 64 neurons  (ReLU)
-    - Hidden Layer 3 : 32 neurons  (ReLU)
-    - Output         : Sigmoid → Pass probability
+    **Model Accuracy: {accuracy}%**
 
-    **Accuracy : 90%**
+    **Architecture**
+    - Input : 5 weeks × 4 features = 20 values
+    - Layer 1 : 128 neurons (ReLU)
+    - Layer 2 : 64 neurons  (ReLU)
+    - Layer 3 : 32 neurons  (ReLU)
+    - Output  : Sigmoid → Pass probability
     """)
     st.divider()
     st.subheader("📊 Features per Week")
@@ -186,10 +194,10 @@ with st.sidebar:
     """)
 
 # ══════════════════════════════════════════════════════════════
-# UI — INPUT TABS
+# UI — INPUT TABS (5 weeks)
 # ══════════════════════════════════════════════════════════════
 st.subheader("📋 Enter Student Weekly Data")
-st.info("📌 Fill data for all 5 weeks using the tabs, then click **Predict**.")
+st.info("📌 Fill all 5 weeks then click **Predict**.")
 
 defaults = {
     "att" : [70, 72, 71, 73, 74],
@@ -205,11 +213,11 @@ for i, tab in enumerate(tabs):
     with tab:
         c1, c2 = st.columns(2)
         with c1:
-            att  = st.slider("Attendance (%)",    0, 100, defaults["att"][i],  key=f"att_{i}")
-            asgn = st.slider("Assignment Marks",  0, 100, defaults["asgn"][i], key=f"asgn_{i}")
+            att  = st.slider("Attendance (%)",   0, 100, defaults["att"][i],  key=f"att_{i}")
+            asgn = st.slider("Assignment Marks", 0, 100, defaults["asgn"][i], key=f"asgn_{i}")
         with c2:
-            quiz = st.slider("Quiz Marks",        0, 100, defaults["quiz"][i], key=f"quiz_{i}")
-            sh   = st.slider("Study Hrs / Week",  0,  15, defaults["sh"][i],   key=f"sh_{i}")
+            quiz = st.slider("Quiz Marks",       0, 100, defaults["quiz"][i], key=f"quiz_{i}")
+            sh   = st.slider("Study Hrs/Week",   0,  15, defaults["sh"][i],   key=f"sh_{i}")
         weekly_inputs.append([att, asgn, quiz, sh])
 
 # ── Trend chart ────────────────────────────────────────────────
@@ -226,8 +234,12 @@ with st.expander("📈 View Weekly Trends"):
 # ══════════════════════════════════════════════════════════════
 st.divider()
 if st.button("🔮 Predict Student Performance", type="primary", use_container_width=True):
-    with st.spinner("Analysing 5-week sequence..."):
-        r = predict_student(weekly_inputs)
+
+    r = predict_student(weekly_inputs)
+
+    if not r["success"]:
+        st.error(f"❌ Error: {r['error']}")
+        st.stop()
 
     st.divider()
     st.subheader("📊 Prediction Result")
@@ -248,7 +260,7 @@ if st.button("🔮 Predict Student Performance", type="primary", use_container_w
         st.metric("🔴 Fail Probability", f"{r['fail_prob']}%")
         st.progress(r['fail_prob'] / 100)
 
-    # ── Advice section ─────────────────────────────────────────
+    # ── Advice ────────────────────────────────────────────────
     st.divider()
     st.subheader("💡 Personalised Advice")
 
@@ -260,31 +272,31 @@ if st.button("🔮 Predict Student Performance", type="primary", use_container_w
 
     tips = []
     if avg_att  < 70: tips.append(f"📅 **Low attendance** (avg {avg_att:.0f}%). Aim for 75%+.")
-    if avg_asgn < 60: tips.append(f"📝 **Weak assignments** (avg {avg_asgn:.0f}%). Submit all work on time.")
-    if avg_quiz < 60: tips.append(f"❓ **Low quiz scores** (avg {avg_quiz:.0f}%). Practice past papers.")
-    if avg_sh   <  5: tips.append(f"⏰ **Low study hours** (avg {avg_sh:.1f} hrs). Aim for 5+ hrs/week.")
+    if avg_asgn < 60: tips.append(f"📝 **Weak assignments** (avg {avg_asgn:.0f}%). Submit all work.")
+    if avg_quiz < 60: tips.append(f"❓ **Low quiz scores** (avg {avg_quiz:.0f}%). Practice more.")
+    if avg_sh   <  5: tips.append(f"⏰ **Low study hours** (avg {avg_sh:.1f} hrs). Aim 5+ hrs/week.")
     if trend    < -5: tips.append("📉 **Attendance declining** week over week — address urgently!")
 
     if tips:
         for t in tips:
             st.warning(t)
     else:
-        st.success("🎉 Excellent profile across all 5 weeks! Keep this momentum going.")
+        st.success("🎉 Excellent profile across all 5 weeks! Keep this momentum.")
 
-# ── Weekly summary table ───────────────────────────────────────
+    # ── Summary table ──────────────────────────────────────────
     st.divider()
     st.subheader("📋 Weekly Summary")
-    summary_df = pd.DataFrame(
-        weekly_inputs,
-        columns=["Attendance","Assignment","Quiz","Study Hours"],
-        index=[f"Week {i+1}" for i in range(5)]
+    st.dataframe(
+        pd.DataFrame(weekly_inputs,
+                     columns=["Attendance","Assignment","Quiz","Study Hours"],
+                     index=[f"Week {i+1}" for i in range(5)]),
+        use_container_width=True
     )
-    st.dataframe(summary_df, use_container_width=True)
 
 # ── Footer ─────────────────────────────────────────────────────
 st.divider()
 st.markdown(
     "<p style='text-align:center;color:gray;font-size:12px;'>"
-    "RNN Student Predictor · MLP Neural Network · Streamlit Cloud · 90% Accuracy"
+    "RNN Student Predictor · scikit-learn MLP · Streamlit Cloud"
     "</p>", unsafe_allow_html=True
 )
